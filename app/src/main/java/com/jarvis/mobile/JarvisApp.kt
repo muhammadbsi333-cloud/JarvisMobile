@@ -12,5 +12,6 @@ class JarvisApp : Application() {
         super.onCreate()
         instance = this
         Prefs.init(this)
+        CrashLog.install(this)
     }
 }

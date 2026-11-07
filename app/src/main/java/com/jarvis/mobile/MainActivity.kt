@@ -64,6 +64,8 @@ class MainActivity : Activity() {
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var wasConnected = false
+    private var ready = false      // the screens were built without an error
+    private var webOk = false      // the phone has a working WebView for the main screen
     private val transcript = ArrayList<Pair<String, String>>()
     private val linkListener: () -> Unit = { ui.post { onLinkChanged() } }
 
@@ -112,9 +114,31 @@ class MainActivity : Activity() {
 
     // -- building the screen --------------------------------------------------------------------
 
-    @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try {
+            setUpScreens()
+            ready = true
+        } catch (e: Throwable) {
+            CrashLog.record(this, e, "starting the screen")
+            showFatal(e)
+        }
+    }
+
+    /** Last resort: say what went wrong on screen so it can be photographed and sent. */
+    private fun showFatal(e: Throwable) {
+        val text = TextView(this)
+        text.setTextIsSelectable(true)
+        text.setPadding(dp(16), dp(40), dp(16), dp(16))
+        text.text = "JARVIS could not start its screen.\n\nPlease send a screenshot of this to the developer:\n\n" +
+            android.util.Log.getStackTraceString(e).take(3000)
+        val scroll = ScrollView(this)
+        scroll.addView(text)
+        setContentView(scroll)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun setUpScreens() {
         window.statusBarColor = Color.parseColor("#010a0c")
         window.navigationBarColor = Color.parseColor("#010a0c")
         tts = TextToSpeech(this) { st -> ttsReady = (st == TextToSpeech.SUCCESS) }
@@ -138,32 +162,39 @@ class MainActivity : Activity() {
         buildSettings()
         setContentView(root)
         root.requestApplyInsets()
-        showSettings(!Prefs.paired && Prefs.geminiKey.isEmpty())
+        showSettings(!webOk || (!Prefs.paired && Prefs.geminiKey.isEmpty()))
     }
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun buildWeb() {
-        web = WebView(this)
-        web.setBackgroundColor(Color.parseColor("#010a0c"))
-        val s = web.settings
-        s.javaScriptEnabled = true
-        s.domStorageEnabled = false
-        s.allowFileAccess = false
-        s.allowContentAccess = false
-        s.blockNetworkLoads = true            // the screen can only talk to the app, never to the internet
-        s.setSupportZoom(false)
-        web.webViewClient = object : WebViewClient() {
-            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
-                ui.post { recreate() }
-                return true
+        try {
+            web = WebView(this)
+            web.setBackgroundColor(Color.parseColor("#010a0c"))
+            val s = web.settings
+            s.javaScriptEnabled = true
+            s.domStorageEnabled = false
+            s.allowFileAccess = false
+            s.allowContentAccess = false
+            s.blockNetworkLoads = true            // the screen can only talk to the app, never to the internet
+            s.setSupportZoom(false)
+            web.webViewClient = object : WebViewClient() {
+                override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                    ui.post { recreate() }
+                    return true
+                }
             }
+            web.addJavascriptInterface(HudBridge(), "JarvisNative")
+            root.addView(web, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            webOk = true
+            loadScreen()
+        } catch (e: Throwable) {
+            webOk = false
+            CrashLog.record(this, e, "WebView")
         }
-        web.addJavascriptInterface(HudBridge(), "JarvisNative")
-        root.addView(web, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        loadScreen()
     }
 
     private fun loadScreen() {
+        if (!webOk) return
         web.loadDataWithBaseURL("https://jarvis.hud/", HudBundle.html(), "text/html", "UTF-8", null)
     }
 
@@ -175,6 +206,18 @@ class MainActivity : Activity() {
         statusView = TextView(this)
         statusView.textSize = 14f
         col.addView(statusView, wide())
+
+        val crash = CrashLog.last(this)
+        if (crash != null) {
+            col.addView(heading("Last crash report - send a screenshot of this to the developer"))
+            val report = note(crash.take(1500))
+            report.setTextIsSelectable(true)
+            col.addView(report, wide())
+            col.addView(button("Clear this report") {
+                CrashLog.clear(this)
+                toast("Cleared")
+            }, wide())
+        }
 
         col.addView(heading("Pair with your PC"))
         col.addView(note("On the PC press Remote Control in JARVIS to get a key. Use the PC's Tailscale address (100.x.y.z:8001) so it also works away from home."))
@@ -270,6 +313,7 @@ class MainActivity : Activity() {
     // -- feeding the page ---------------------------------------------------------------------------
 
     private fun js(code: String) {
+        if (!webOk) return
         ui.post {
             try {
                 web.evaluateJavascript("(function(){if(window.jarvis){$code}})();", null)
@@ -309,7 +353,9 @@ class MainActivity : Activity() {
         val listenerOn = NotificationManagerCompat.getEnabledListenerPackages(this).contains(packageName)
         val overlayOn = Settings.canDrawOverlays(this)
         val pc = if (Prefs.paired) Link.status else "Not paired with a PC"
-        statusView.text = "$pc\nMain screen: ${HudBundle.version()}\n" +
+        val screen = if (webOk) "Main screen: ${HudBundle.version()}"
+        else "Main screen unavailable: this phone's WebView is missing or switched off (settings still work)"
+        statusView.text = "$pc\n$screen\n" +
             "Notification access: ${if (listenerOn) "on" else "off"}   " +
             "Open apps in background: ${if (overlayOn) "on" else "off"}"
     }
@@ -349,6 +395,7 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        if (!ready) return
         Link.listen(linkListener)
         if (Prefs.paired) {
             JarvisService.start(this)
@@ -360,6 +407,10 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
+        if (!ready) {
+            super.onStop()
+            return
+        }
         Link.unlisten(linkListener)
         closeChat()
         super.onStop()
@@ -367,9 +418,11 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         tts?.shutdown()
-        web.removeJavascriptInterface("JarvisNative")
-        root.removeView(web)
-        web.destroy()
+        if (ready && webOk) {
+            web.removeJavascriptInterface("JarvisNative")
+            root.removeView(web)
+            web.destroy()
+        }
         super.onDestroy()
     }
 
